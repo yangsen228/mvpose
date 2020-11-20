@@ -2,6 +2,8 @@ import os
 import os.path as osp
 import pickle
 import sys
+sys.path.insert(0, 'backend/inter_hand/main')
+sys.path.insert(0, 'backend/inter_hand')
 import time
 
 import coloredlogs, logging
@@ -18,19 +20,12 @@ from src.models.estimate3d import MultiEstimator
 from src.m_utils.evaluate import numpify
 from src.m_utils.mem_dataset import MemDataset
 
-
 def export(model, loader, is_info_dicts=False, show=False):
-    pose_list = list ()
-    pose2d_list = list ()
+    pose3d_list, pose2d_list, hand_bbox_list, hand_pose_list = list (), list (), list(), list()
     print('num of frames: {}'.format(len(loader)))
     with torch.no_grad():
         t_start = time.time()
         for img_id, imgs in enumerate ( tqdm ( loader ) ):
-            try:
-                pass
-            except Exception as e:
-                pass
-                # poses3d = model.estimate3d ( img_id=img_id, show=False )
             if is_info_dicts:
                 info_dicts = numpify ( imgs )
 
@@ -41,14 +36,16 @@ def export(model, loader, is_info_dicts=False, show=False):
                 this_imgs = list ()  # len(this_imgs) = 3
                 for img_batch in imgs:
                     this_imgs.append ( img_batch.squeeze ().numpy () )  # this_imgs[0].shape = (288, 360, 3)
-                poses3d, pose2d = model.predict ( imgs=this_imgs, camera_parameter=camera_parameter, template_name='Unified',
+                poses3d, pose2d, hand_bbox, hand_pose = model.predict ( imgs=this_imgs, camera_parameter=camera_parameter, template_name='Unified',
                                             show=show, plt_id=img_id )
 
-            pose_list.append ( poses3d )
+            pose3d_list.append ( poses3d )
             pose2d_list.append ( pose2d )
+            hand_bbox_list.append ( hand_bbox )
+            hand_pose_list.append ( hand_pose )
         t_end = time.time()
         print('overall avg time: {}'.format((t_end - t_start) / len(loader)))
-    return pose_list, pose2d_list
+    return pose3d_list, pose2d_list, hand_bbox_list, hand_pose_list
 
 
 if __name__ == '__main__':
@@ -79,7 +76,7 @@ if __name__ == '__main__':
         elif dataset_name == 'Lit':
             dataset_path = model_cfg.lit_path
             # you can change the test_rang to visualize different images (0~1999)
-            test_range = [i for i in range (171, 272, 1 )]
+            test_range = [i for i in range (210, 250, 1 )]  # (171, 272)
             gt_path = dataset_path 
 
         else:
@@ -100,15 +97,10 @@ if __name__ == '__main__':
             logger.info("=============================================")
 
         test_loader = DataLoader ( test_dataset, batch_size=1, pin_memory=True, num_workers=6, shuffle=False )
-        pose_in_range, pose_in_pixel = export ( test_model, test_loader, is_info_dicts=bool ( args.dumped_dir ), show=False )
+        pose_in_range, pose_in_pixel, hand_in_bbox, hand_pose_in_range = export ( test_model, test_loader, is_info_dicts=bool ( args.dumped_dir ), show=False )
+        
+        output = {'pose3d':pose_in_range, 'pose2d':pose_in_pixel, 'handbox':hand_in_bbox, 'hand3d':hand_pose_in_range}
         with open ( osp.join ( model_cfg.root_dir, 'result',
                                time.strftime ( str ( model_cfg.testing_on ) + "_%Y_%m_%d_%H_%M",
                                                time.localtime ( time.time () ) ) + '.pkl' ), 'wb' ) as f:
-            pickle.dump ( pose_in_range, f )
-        
-        with open ( osp.join ( model_cfg.root_dir, 'result',
-                               time.strftime ( str ( model_cfg.testing_on ) + "2d_%Y_%m_%d_%H_%M",
-                                               time.localtime ( time.time () ) ) + '.pkl' ), 'wb' ) as f:
-            pickle.dump ( pose_in_pixel, f )
-
-
+            pickle.dump ( output, f )

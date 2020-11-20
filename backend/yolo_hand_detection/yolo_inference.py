@@ -5,7 +5,7 @@ import os
 import cv2
 
 
-def yolo_hand_detection(yolo, img, network='normal', size=640, confidence=0.5): # confidence=0.25
+def yolo_hand_detection(yolo, img, network='normal', size=640, confidence=0.6): # confidence=0.25
     yolo.size = int(size)
     yolo.confidence = float(confidence)
 

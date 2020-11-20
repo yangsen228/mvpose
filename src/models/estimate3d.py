@@ -15,7 +15,6 @@ import coloredlogs, logging
 
 logger = logging.getLogger ( __name__ )
 coloredlogs.install ( level='DEBUG', logger=logger )
-import os.path  as osp
 import cv2
 import torch
 import numpy as np
@@ -28,10 +27,16 @@ from src.m_utils.visualize import show_panel_mem, plotPaperRows
 # from src.models import pictorial
 from src.m_lib import pictorial
 
-# hand
+# hand_bbox
 from backend.yolo_hand_detection.yolo_inference import yolo_hand_detection
 from backend.yolo_hand_detection.yolo import YOLO
-
+# hand_pose
+from config import cfg
+from common.base import Tester
+from common.utils.vis import vis_keypoints
+import torch.backends.cudnn as cudnn
+from common.utils.transforms import flip
+import torchvision.transforms as transforms
 
 class MultiEstimator ( object ):
     def __init__(self, cfg, debug=False):
@@ -39,52 +44,100 @@ class MultiEstimator ( object ):
         self.extractor = FeatureExtractor ()
         self.cfg = cfg
         self.dataset = None
-
+        # hand bbox
         self.yolo = YOLO("/home/yxs/lit/mvpose/backend/yolo_hand_detection/models/cross-hands.cfg", \
             "/home/yxs/lit/mvpose/backend/yolo_hand_detection/models/cross-hands.weights", ["hand"])
         self.sample_range = 120
+        self.expand_rate = 1.5
+        # hand pose
+        self.tester = Tester('49')
+        self.tester._make_batch_generator('test', 'all')
+        self.tester._make_model()
+        # coord transformation
+        self.transform = lambda R, P: (R.t() @ P.t()).t()
+
+    def expand_bbox(self, b, x_max, y_max):
+        xl, xr = np.clip(int(b[0]-b[2]*(self.expand_rate-1)/2.0), 0, x_max), np.clip(int(b[0]+b[2]+b[2]*(self.expand_rate-1)/2.0), 0, x_max)
+        yt, yb = np.clip(int(b[1]-b[3]*(self.expand_rate-1)/2.0), 0, y_max), np.clip(int(b[1]+b[3]+b[3]*(self.expand_rate-1)/2.0), 0, y_max)
+        expanded_b = [xl,yt,xr-xl,yb-yt]
+        return expanded_b
 
     def predict(self, imgs, camera_parameter, template_name='Shelf', show=False, plt_id=0):
-        # t_start = time.time()
+        # 2d human pose estimation for all views
         info_dict = self._infer_single2d ( imgs )
-        # t_end = time.time()
-        # print('2d estimation time: {}'.format(t_end - t_start))
 
         self.dataset = MemDataset ( info_dict=info_dict, camera_parameter=camera_parameter,
                                     template_name=template_name )
-        # t_end2 = time.time()
-        # print('matching time: {}'.format(t_end2 - t_end))
-
-        tmp = self._estimate3d ( 0, show=show, plt_id=plt_id )
-        # t_end3 = time.time()
-        # print('3d estimation time: {}'.format(t_end3 - t_end2))
-
-        pose2d = self._detect_hand(info_dict, imgs)
         
-        return tmp, pose2d
+        # 3d huamn pose reconstruction
+        pose3d = self._estimate3d ( 0, show=show, plt_id=plt_id )
+        
+        # hand bbox detection for all views
+        pose2d, hand_bbox = self._detect_hand(imgs, info_dict)
 
-    def _detect_hand(self, info_dict, imgs):
-        '''
-        '''
-        pose2d = []
-        hand_bbox = []
+        # 3d hand pose estimation
+        cam_id = 1
+        hand_pose = self._estimate_hand_pose(imgs, hand_bbox, camera_parameter, cam_id)
+        
+        return pose3d, pose2d, hand_bbox, hand_pose
+
+    def _detect_hand(self, imgs, info_dict):
+        pose2d, hand_bbox  = [], []
         for cam_id, img in enumerate(imgs):   # 遍历每个视角
             pose_tmp, hand_tmp = [], []
             for res in info_dict[cam_id][0]:  # 遍历每个人
                 pose_tmp.append(res['pose2d'])
                 for joint_id in [9,10]:
                     # get rough bbox
-                    cx1, cy1 = res['pose2d'][joint_id*3], res['pose2d'][joint_id*3+1]  # 左右手关节位置
+                    cx1, cy1 = res['pose2d'][joint_id*3], res['pose2d'][joint_id*3+1]  # 左/右手关节位置
                     max_x1, max_y1 = img.shape[1] - 1, img.shape[0] - 1
                     xl1, xr1 = np.clip(int(cx1-self.sample_range), 0, max_x1), np.clip(int(cx1+self.sample_range), 0, max_x1)  # rough bbox的x方向范围
                     yt1, yb1 = np.clip(int(cy1-self.sample_range), 0, max_y1), np.clip(int(cy1+self.sample_range), 0, max_y1)  # rough bbox的y方向范围
                     cropped_img = img[yt1:yb1, xl1:xr1, :]
                     # get accurate bbox
                     cnt, conf, bbox = yolo_hand_detection(self.yolo, cropped_img)
-
+                    bbox = [[b[0]+xl1, b[1]+yt1, b[2], b[3]] for b in bbox]            # 将bbox转换到原图坐标系下 [x,y,w,h]
+                    if cnt == 0:
+                        hand_tmp.append(bbox)
+                    else:
+                        dist = [(cx1-(b[0]+b[2]/2))**2 + (cy1-(b[1]+b[3]/2))**2 for b in bbox]    # 计算每个bbox的中心到joint的距离
+                        hand_tmp.append(self.expand_bbox(bbox[np.argmin(dist)], max_x1, max_y1))  # 选择距离joint最近的bbox)
             pose2d.append(pose_tmp)
+            hand_bbox.append(hand_tmp)
+        return pose2d, hand_bbox
 
-        return pose2d
+    def _estimate_hand_pose(self, imgs, hand_bbox, camera_parameter, cam_id):
+        img, bbox = imgs[cam_id], hand_bbox[cam_id]
+        R = torch.tensor(camera_parameter['RT'][cam_id][:,:-1].astype(np.float32))  # cam_id视角的旋转矩阵
+        hand_pose = []
+        with torch.no_grad():
+            for b in bbox:
+                if len(b) > 0:
+                    # crop img
+                    img_patch = cv2.resize(img[b[1]:b[1]+b[3], b[0]:b[0]+b[2], :], (int(cfg.input_img_shape[1]), int(cfg.input_img_shape[0])), interpolation=cv2.INTER_LINEAR)
+                    img_patch = img_patch.astype(np.float32)
+
+                    trans = transforms.ToTensor()
+                    input = trans(img_patch.astype(np.float32))/255.
+                    input = input.unsqueeze(0)
+                    
+                    inputs = {'img':input}
+
+                    out = self.tester.model(inputs, 'test')
+                    joint_coord_out = out['joint_coord'].cpu().numpy()
+                    hand_type_out = out['hand_type'].cpu().numpy()
+
+                    idx = np.argmax(hand_type_out)
+                    if hand_type_out[0][idx] < 0.8:   # 忽略置信度小于0.8的结果
+                        hand_pose.append([])
+                        continue
+                    print(hand_type_out, idx)
+                    cur_pose = joint_coord_out[0, 21*idx:21*(idx+1), :] - joint_coord_out[0, 21*idx, :]  # 选择置信度更高的pose，并平移到以手腕为坐标原点的位置
+                    hand_pose.append(self.transform(R, torch.tensor(cur_pose)).numpy())
+                else:
+                    hand_pose.append([])
+
+        return hand_pose
 
     def _infer_single2d(self, imgs, img_id=0, dir='/home/jiangwen/tmp/Multi'):
         '''
@@ -115,6 +168,7 @@ class MultiEstimator ( object ):
 
     def _estimate3d(self, img_id, show=False, plt_id=0):
         data_batch = self.dataset[img_id]
+        # ReID affinity matrix
         affinity_mat = self.extractor.get_affinity ( data_batch, rerank=self.cfg.rerank )
         if self.cfg.rerank:
             affinity_mat = torch.from_numpy ( affinity_mat )
@@ -126,9 +180,10 @@ class MultiEstimator ( object ):
 
         info_list = list ()
         for cam_id in self.dataset.cam_names:
-            info_list += self.dataset.info_dict[cam_id][img_id]
+            info_list += self.dataset.info_dict[cam_id][img_id]    # list of dict: 每个人一个dict
 
-        pose_mat = np.array ( [i['pose2d'] for i in info_list] ).reshape ( -1, model_cfg.joint_num, 3 )[..., :2]
+        # Geometry affinity matrix
+        pose_mat = np.array ( [i['pose2d'] for i in info_list] ).reshape ( -1, model_cfg.joint_num, 3 )[..., :2]   # shape = (累计人数, num_joint, 2)
         geo_affinity_mat = geometry_affinity ( pose_mat.copy (), self.dataset.F.numpy (),
                                                self.dataset.dimGroup[img_id] )
         geo_affinity_mat = torch.tensor ( geo_affinity_mat )
@@ -147,7 +202,7 @@ class MultiEstimator ( object ):
         W[torch.isnan ( W )] = 0  # Some times (Shelf 452th img eg.) torch.sqrt will return nan if its too small
         sub_imgid2cam = np.zeros ( pose_mat.shape[0], dtype=np.int32 )
         for idx, i in enumerate ( range ( len ( dimGroup ) - 1 ) ):
-            sub_imgid2cam[dimGroup[i]:dimGroup[i + 1]] = idx
+            sub_imgid2cam[dimGroup[i]:dimGroup[i + 1]] = idx     # sub_imgid2cam[person_id] = cam_id
 
         num_person = 10
         X0 = torch.rand ( W.shape[0], num_person )

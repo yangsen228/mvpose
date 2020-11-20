@@ -29,15 +29,9 @@ class Estimator_2d ( object ):
         len(dump_results): num of detected people
         dump_results[0].keys() = dict_keys(['image_id', 'category_id', 'score', 'keypoints', 'bbox', 'heatmaps', 'crops'])
         '''
-        # import time
-        # t_start = time.time()
         bbox_result = self.bbox_detector.detect ( img, img_id )
-        # t_end = time.time()
-        # print('bbox time: {}'.format(t_end - t_start))
 
         dump_results = self.pose_detector_2d.detect ( bbox_result )
-        # t_end2 = time.time()
-        # print('2d time: {}'.format(t_end2 - t_end))
         return dump_results
 
     # def light_estimate_2d(self, img):
