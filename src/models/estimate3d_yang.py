@@ -51,7 +51,7 @@ class MultiEstimator ( object ):
             info_list += self.dataset.info_dict[cam_id][img_id]    # list of dict: 每个人一个dict
 
         # Geometry affinity matrix
-        pose_mat = np.array ( [i['pose2d'][:17] for i in info_list] ).reshape ( -1, model_cfg.joint_num, 3 )[..., :2]   # shape = (累计人数, num_joint, 2)
+        pose_mat = np.array ( [i['pose2d'] for i in info_list] ).reshape ( -1, model_cfg.joint_num, 3 )[..., :2]   # shape = (累计人数, num_joint, 2)
         geo_affinity_mat = geometry_affinity ( pose_mat.copy (), self.dataset.F.numpy (),
                                                self.dataset.dimGroup[img_id] )
         geo_affinity_mat = torch.tensor ( geo_affinity_mat )
@@ -120,7 +120,7 @@ class MultiEstimator ( object ):
             plotPaperRows ( self.dataset, matched_list, info_list, sub_imgid2cam, img_id, affinity_mat,
                             geo_affinity_mat, W, plt_id, multi_pose3d )
 
-        return multi_pose3d, matched_list, features
+        return multi_pose3d
 
     def _hybrid_kernel(self, matched_list, pose_mat, sub_imgid2cam, img_id):
         return pictorial.hybrid_kernel ( self, matched_list, pose_mat, sub_imgid2cam, img_id )
